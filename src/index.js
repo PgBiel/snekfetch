@@ -1,35 +1,48 @@
-// next-tick requiring stream so that by the time i actually need it webpack has processed the
-// Readable and PassThrough exports
 require('stream');
-const browser = require('os').platform() === 'browser';
+const zlib = require('zlib');
+const qs = require('querystring');
 const http = require('http');
 const https = require('https');
 const URL = require('url');
-const zlib = require('zlib');
+const Package = require('../package.json');
 const Stream = require('stream');
 const FormData = require('./FormData');
-const Package = require('../package.json');
 
 class Snekfetch extends Stream.Readable {
-  constructor(method, url) {
+  constructor(method, url, opts = { headers: {}, data: null }) {
     super();
-    this.method = method.toUpperCase();
-    this.url = url;
-    this.headers = {};
-    this.data = null;
-    this.spent = false;
+
+    const options = URL.parse(url);
+    options.method = method.toUpperCase();
+    options.headers = opts.headers;
+    this.data = opts.data;
+
+    this.request = (options.protocol === 'https:' ? https : http).request(options);
+  }
+
+  query(name, value) {
+    if (this.request.res) throw new Error('Cannot modify query after being sent!');
+    if (!this.request.query) this.request.query = {};
+    if (name !== null && typeof name === 'object') {
+      this.request.query = Object.assign(this.request.query, name);
+    } else {
+      this.request.query[name] = value;
+    }
+    return this;
   }
 
   set(name, value) {
+    if (this.request.res) throw new Error('Cannot modify headers after being sent!');
     if (name !== null && typeof name === 'object') {
       for (const key of Object.keys(name)) this.set(key, name[key]);
     } else {
-      this.headers[name] = value;
+      this.request.setHeader(name, value);
     }
     return this;
   }
 
   attach(name, data, filename) {
+    if (this.request.res) throw new Error('Cannot modify data after being sent!');
     const form = this._getFormData();
     this.set('Content-Type', `multipart/form-data; boundary=${form.boundary}`);
     form.append(name, data, filename);
@@ -38,9 +51,18 @@ class Snekfetch extends Stream.Readable {
   }
 
   send(data) {
-    if (typeof data === 'object') {
-      this.set('Content-Type', 'application/json');
-      this.data = JSON.stringify(data);
+    if (this.request.res) throw new Error('Cannot modify data after being sent!');
+    if (data !== null && typeof data === 'object') {
+      const header = this._getHeader('content-type');
+      let serialize;
+      if (header) {
+        if (header.includes('json')) serialize = JSON.stringify;
+        else if (header.includes('urlencoded')) serialize = qs.stringify;
+      } else {
+        this.set('Content-Type', 'application/json');
+        serialize = JSON.stringify;
+      }
+      this.data = serialize(data);
     } else {
       this.data = data;
     }
@@ -48,20 +70,20 @@ class Snekfetch extends Stream.Readable {
   }
 
   then(resolver, rejector) {
-    if (this.spent) return Promise.reject(new Error('Request has been spent!'));
-    return new Promise((resolve) => {
-      this.spent = true;
-      if (!this.headers['user-agent']) {
-        this.set('user-agent', `snekfetch/${Snekfetch.version} (${Package.repository.url.replace(/\.?git/, '')})`);
-      }
+    return new Promise((resolve, reject) => {
+      const request = this.request;
 
-      const options = URL.parse(this.url);
-      options.method = this.method;
-      options.headers = this.headers;
+      const handleError = (err) => {
+        if (!err) err = new Error('Unknown error occured');
+        err.request = request;
+        reject(err);
+      };
 
-      const request = (options.protocol === 'https:' ? https : http)
-      .request(options, (response) => {
-        response.request = request;
+      request.on('abort', handleError);
+      request.on('aborted', handleError);
+      request.on('error', handleError);
+
+      request.on('response', (response) => {
         const stream = new Stream.PassThrough();
         if (this._shouldUnzip(response)) {
           response.pipe(zlib.createUnzip({
@@ -73,69 +95,97 @@ class Snekfetch extends Stream.Readable {
         }
 
         let body = [];
+
         stream.on('data', (chunk) => {
-          if (!this.push(chunk)) stream.pause();
+          if (!this.push(chunk)) this.pause();
           body.push(chunk);
         });
+
         stream.on('end', () => {
           this.push(null);
           const concated = Buffer.concat(body);
-          if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
-            resolve(new Snekfetch(this.method, URL.resolve(this.url, response.headers.location)));
+
+          if (this._shouldRedirect(response)) {
+            if ([301, 302].includes(response.statusCode)) {
+              this.method = this.method === 'HEAD' ? 'HEAD' : 'GET';
+              this.data = null;
+            } else if (response.statusCode === 303) {
+              this.method = 'GET';
+            }
+
+            const headers = {};
+            if (this.request._headerNames) {
+              for (const name of Object.keys(this.request._headerNames)) {
+                headers[this.request._headerNames[name]] = this.request._headers[name];
+              }
+            } else {
+              for (const name of Object.keys(this.request._headers)) {
+                const header = this.request._headers[name];
+                headers[header.name] = header.value;
+              }
+            }
+
+            resolve(new Snekfetch(
+              this.method,
+              URL.resolve(makeURLFromRequest(request), response.headers.location),
+              { data: this.data, headers }
+            ));
             return;
           }
 
           const res = {
-            request: this.options,
+            request: this.request,
             body: concated,
             text: concated.toString(),
             ok: response.statusCode >= 200 && response.statusCode < 300,
             headers: response.headers,
             status: response.statusCode,
             statusText: response.statusText || http.STATUS_CODES[response.statusCode],
-            url: this.url,
           };
 
           const type = response.headers['content-type'];
-          if (type.includes('application/json')) {
-            try {
-              res.body = JSON.parse(res.text);
-            } catch (err) {} // eslint-disable-line no-empty
-          } else if (type.includes('application/x-www-form-urlencoded')) {
-            res.body = {};
-            for (const [k, v] of res.text.split('&').map(q => q.split('='))) res.body[k] = v;
+          if (type) {
+            if (type.includes('application/json')) {
+              try {
+                res.body = JSON.parse(res.text);
+              } catch (err) {} // eslint-disable-line no-empty
+            } else if (type.includes('application/x-www-form-urlencoded')) {
+              res.body = qs.parse(res.text);
+            }
           }
 
-          resolve(res);
+          if (res.ok) {
+            resolve(res);
+          } else {
+            const err = new Error(`${res.status} ${res.statusText}`.trim());
+            Object.assign(err, res);
+            reject(err);
+          }
         });
       });
-      const data = this.data ? this.data.end ? this.data.end() : this.data : null;
-      request.end(data);
+
+      this._addFinalHeaders();
+      if (this.request.query) this.request.path = `${this.request.path}?${qs.stringify(this.request.query)}`;
+      request.end(this.data ? this.data.end ? this.data.end() : this.data : null);
     })
-    .then((res) => resolver ? resolver(res) : res)
-    .catch((err) => rejector ? rejector(err) : err);
+    .then(resolver, rejector);
+  }
+
+  catch(rejector) {
+    return this.then(null, rejector);
   }
 
   end(cb) {
-    return this.then((res) => {
-      if (res.ok) {
-        return cb(null, res);
-      } else {
-        const err = new Error(`${res.status} ${res.statusText}`.trim());
-        Object.assign(err, res);
-        return cb(err, res);
-      }
-    }).catch((err) => cb(err));
-  }
-
-  catch(f) {
-    return this.then(null, f);
+    return this.then(
+      (res) => cb ? cb(null, res) : res,
+      (err) => cb ? cb(err, err.status ? err : null) : err
+    );
   }
 
   _read() {
     this.resume();
-    if (this.spent) return;
-    this.then().catch(() => {}); // eslint-disable-line no-empty-function
+    if (this.response) return;
+    this.catch((err) => this.emit('error', err));
   }
 
   _shouldUnzip(res) {
@@ -144,16 +194,52 @@ class Snekfetch extends Stream.Readable {
     return /^\s*(?:deflate|gzip)\s*$/.test(res.headers['content-encoding']);
   }
 
+  _shouldRedirect(res) {
+    return [301, 302, 303, 307, 308].includes(res.statusCode);
+  }
+
   _getFormData() {
     if (!this._formData) this._formData = new FormData();
     return this._formData;
+  }
+
+  _addFinalHeaders() {
+    if (!this.request) return;
+    if (!this._getHeader('user-agent')) {
+      this.set('User-Agent', `snekfetch/${Snekfetch.version} (${Package.repository.url.replace(/\.?git/, '')})`);
+    }
+    if (this.request.method !== 'HEAD') this.set('Accept-Encoding', 'gzip, deflate');
+  }
+
+  get response() {
+    return this.request.res || this.request._response || null;
+  }
+
+  _getHeader(header) {
+    // https://github.com/jhiesey/stream-http/pull/77
+    try {
+      return this.request.getHeader(header);
+    } catch (err) {
+      return null;
+    }
   }
 }
 
 Snekfetch.version = Package.version;
 
-Snekfetch.METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH', 'BREW'];
-for (const method of Snekfetch.METHODS) Snekfetch[method.toLowerCase()] = (url) => new Snekfetch(method, url);
+Snekfetch.METHODS = http.METHODS.concat('BREW');
+for (const method of Snekfetch.METHODS) {
+  Snekfetch[method === 'M-SEARCH' ? 'msearch' : method.toLowerCase()] = (url) => new Snekfetch(method, url);
+}
 
-module.exports = Snekfetch;
-if (browser) window.Snekfetch = Snekfetch;
+if (typeof module !== 'undefined') module.exports = Snekfetch;
+else if (typeof window !== 'undefined') window.Snekfetch = Snekfetch;
+
+function makeURLFromRequest(request) {
+  return URL.format({
+    protocol: request.connection.encrypted ? 'https:' : 'http:',
+    hostname: request.getHeader('host'),
+    pathname: request.path.split('?')[0],
+    query: request.query,
+  });
+}
